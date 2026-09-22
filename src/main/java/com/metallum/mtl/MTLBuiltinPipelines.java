@@ -1,5 +1,6 @@
 package com.metallum.mtl;
 
+import com.metallum.Metallum;
 import com.metallum.objc.AutoreleasePool;
 import com.metallum.objc.ObjC;
 import net.fabricmc.api.EnvType;
@@ -11,6 +12,7 @@ import org.lwjgl.system.MemoryStack;
 import java.lang.foreign.MemorySegment;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static java.lang.foreign.ValueLayout.JAVA_FLOAT;
 
@@ -97,6 +99,8 @@ public final class MTLBuiltinPipelines {
     private static MemorySegment presentNearestSampler = MemorySegment.NULL;
     private static final Map<Long, MemorySegment> clearPipelines = new HashMap<>();
     private static final Map<Long, MemorySegment> depthStencilStates = new HashMap<>();
+    private static final AtomicBoolean LOGGED_FIRST_DRAWABLE = new AtomicBoolean();
+    private static final AtomicBoolean LOGGED_NULL_DRAWABLE = new AtomicBoolean();
 
     private MTLBuiltinPipelines() {
     }
@@ -264,6 +268,9 @@ public final class MTLBuiltinPipelines {
         try (AutoreleasePool _ = AutoreleasePool.push()) {
             CAMetalDrawable drawable = layer.nextDrawable();
             if (drawable == null) {
+                if (LOGGED_NULL_DRAWABLE.compareAndSet(false, true)) {
+                    Metallum.LOGGER.warn("Metal: CAMetalLayer returned no drawable, frame not presented");
+                }
                 return;
             }
             MemorySegment drawableTexture = drawable.texture();
@@ -286,6 +293,9 @@ public final class MTLBuiltinPipelines {
 
             long drawableWidth = MTLTexture.width(drawableTexture);
             long drawableHeight = MTLTexture.height(drawableTexture);
+            if (LOGGED_FIRST_DRAWABLE.compareAndSet(false, true)) {
+                Metallum.LOGGER.info("Metal: presenting first frame (drawable {}x{})", drawableWidth, drawableHeight);
+            }
             encoder.setViewport(0.0, 0.0, drawableWidth, drawableHeight, 0.0, 1.0);
             encoder.setRenderPipelineState(presentPipeline);
             encoder.setFragmentTexture(sourceTexture, 0L);
