@@ -28,6 +28,7 @@ import org.jspecify.annotations.Nullable;
 import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
@@ -39,8 +40,9 @@ final class MetalDevice implements GpuDeviceBackend {
     private final MetalCommandEncoder commandEncoder;
     private final DeviceInfo deviceInfo;
     public final MTLCommandQueue commandQueue;
-    private final Map<MslFunctionKey, MemorySegment> functionCache = new HashMap<>();
-    private final Map<Long, MemorySegment> depthStencilStates = new HashMap<>();
+    private final Map<MslFunctionKey, MemorySegment> functionCache = new ConcurrentHashMap<>();
+    private final Map<Long, MemorySegment> depthStencilStates = new ConcurrentHashMap<>();
+    private final Object shaderStateLock = new Object();
     @Nullable
     private CAMetalLayer metalLayer;
     @Nullable
@@ -203,12 +205,21 @@ final class MetalDevice implements GpuDeviceBackend {
         if (cached != null) {
             return cached;
         }
-        try (MTLDepthStencilDescriptor descriptor = MTLDepthStencilDescriptor.create()) {
-            descriptor.depthCompareFunction(compareFunction);
-            descriptor.depthWriteEnabled(writeDepth);
-            MemorySegment state = metalDevice.newDepthStencilState(descriptor);
-            depthStencilStates.put(key, state);
-            return state;
+        // Pipelines are compiled concurrently from worker threads: only create each state once.
+        synchronized (this.shaderStateLock) {
+            cached = depthStencilStates.get(key);
+            if (cached != null) {
+                return cached;
+            }
+            try (MTLDepthStencilDescriptor descriptor = MTLDepthStencilDescriptor.create()) {
+                descriptor.depthCompareFunction(compareFunction);
+                descriptor.depthWriteEnabled(writeDepth);
+                MemorySegment state = metalDevice.newDepthStencilState(descriptor);
+                if (!ObjC.isNil(state)) {
+                    depthStencilStates.put(key, state);
+                }
+                return state;
+            }
         }
     }
 
@@ -221,10 +232,23 @@ final class MetalDevice implements GpuDeviceBackend {
     }
 
     MemorySegment getOrCompileFunction(final String msl, final String entryPoint) {
-        return this.functionCache.computeIfAbsent(
-                new MslFunctionKey(msl, entryPoint),
-                key -> this.metalDevice.newFunction(key.msl(), key.entryPoint())
-        );
+        MslFunctionKey key = new MslFunctionKey(msl, entryPoint);
+        MemorySegment cached = this.functionCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        // Pipelines are compiled concurrently from worker threads: compile each function once.
+        synchronized (this.shaderStateLock) {
+            cached = this.functionCache.get(key);
+            if (cached != null) {
+                return cached;
+            }
+            MemorySegment function = this.metalDevice.newFunction(msl, entryPoint);
+            if (!ObjC.isNil(function)) {
+                this.functionCache.put(key, function);
+            }
+            return function;
+        }
     }
 
     private record MslFunctionKey(String msl, String entryPoint) {
@@ -244,7 +268,7 @@ final class MetalDevice implements GpuDeviceBackend {
                 "Metal",
                 1.0F,
                 new DeviceLimits(16, 256, 16384, maxMemoryAllocationSize, 0, 1, 65536),
-                new DeviceFeatures(false, false, false, true, true, true, false, true),
+                new DeviceFeatures(true, false, false, true, true, true, false, true),
                 extensions,
                 new HintsAndWorkarounds(false, false, false, false),
                 type
