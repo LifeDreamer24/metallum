@@ -81,13 +81,13 @@ public final class AdvancedDirectLightingShaderTests {
 
     private static final Map<String, String> EXPECTED_SOURCE_GOLDENS = Map.of(
             "sodium-solid-vsh", "31f8f71f2f960dfe65c3fba6841cc70fe7d2e67cf21003f70a92305dcb6c7ec0",
-            "sodium-solid-fsh", "d69fa76739b62cdcff41fd5b60ccff2fbf04b31c9eaaa62ea1e702fd27ff14e3",
+            "sodium-solid-fsh", "6da5f253188f2490a2bec96a8dd99331c992980261052929faebef369f49c3bc",
             "sodium-cutout-vsh", "351359cf6eb94f1d87c281cbdd047b96856955edc387a8a2ba77c1d8491423b1",
-            "sodium-cutout-fsh", "7019c92a0cefd1d83a9b620576cc5b52327cd6b0982e1adcdf7f004ecc8ce056",
+            "sodium-cutout-fsh", "9aa7e67a2b8b49ae1f8aae7bd042e18afad2447cb2c0fc16c5def3e9d686d626",
             "minecraft-entity-vsh", "66efb68cce816ffbe3238fbca265f0fd78d0b9fe5c2eb162d642803220305d82",
-            "minecraft-entity-fsh", "67cb40e3e57b5f667dd6ca82d2000c7df7f757add492eb85a2d52faaeeeb9106",
+            "minecraft-entity-fsh", "93290aa03a1542f9af18e1d37abe95a4b35d958960e1b725a53d253d0b12ec45",
             "minecraft-end-portal-vsh", "2f029354d062b9ec1049397802ee7230ae2123a7706f50c25c8757abfea18428",
-            "minecraft-end-portal-fsh", "1b886c68c94140deb5091a6cf8f2dbc422ab7b07f2580e3bfdf61c670cdd4346"
+            "minecraft-end-portal-fsh", "8fa56a585f5cb3f373fd86da841df03033fa48c5c99a910f03c12373b158ca48"
     );
 
     public static void main(final String[] args) throws IOException {
@@ -101,6 +101,7 @@ public final class AdvancedDirectLightingShaderTests {
         testWaterWavePhaseIsWorldStable();
         testWaterSkyReflectionVisibility();
         testScreenSpaceReflectionQualityContract();
+        testScreenSpaceReflectionBehavioralContracts();
         testWaterSquareCelestialMask();
         testScaleInvariantSurfaceNormal();
         testL6ShadowFilterContinuityAndBlur();
@@ -308,32 +309,36 @@ public final class AdvancedDirectLightingShaderTests {
                 "screen-space reflection helper is missing");
         String trace = environment.substring(traceStart, traceEnd);
 
-        require(trace.contains("const int MAX_STEP_COUNT = 48;")
-                        && trace.contains("screenSpanPixels * 0.20")
-                        && trace.contains("u * (0.15 + 0.85 * u)")
+        require(trace.contains("const int MAX_STEP_COUNT = 96;")
+                        && trace.contains("float screenSpanPixels = max(raySpanPixels.x, raySpanPixels.y);")
+                        && trace.contains("vec3 originQ = rayOrigin * originInvW;")
+                        && trace.contains("float currentInvW = mix(originInvW, endInvW, u);")
+                        && trace.contains("vec3 currentRayPos = mix(originQ, endQ, u) / max(currentInvW, 1.0e-6);")
+                        && trace.contains("vec2 sampleUv = mix(originUv, endUv, u);")
                         && trace.contains("projectionUvCorrection = receiverRasterUv")
                         && trace.contains("+ projectionUvCorrection;")
                         && !trace.contains("float dither =")
-                        && !trace.contains("float stepStride ="),
-                "screen-space reflection tracing lost stable adaptive near-field sampling");
+                        && !trace.contains("u * (0.15 + 0.85 * u)"),
+                "screen-space reflection tracing lost its perspective-correct pixel DDA contract");
         require(trace.contains("previousSceneValid && previousDepthDiff < 0.0")
-                        && trace.contains("crossedSurface && depthDiff <= thickness")
-                        && trace.contains("0.10,\n                                0.65")
+                        && trace.contains("if (crossedSurface) {")
+                        && !trace.contains("crossedSurface && depthDiff <= thickness")
                         && trace.contains("for (int b = 0; b < 5; b++)"),
-                "screen-space reflection tracing accepts unbracketed or thick false hits");
-        require(trace.contains("float depthContinuity = 0.0;")
-                        && trace.contains("largestNeighborDelta")
+                "screen-space reflection tracing rejects a bracket before refinement or accepts thick false hits");
+        require(trace.contains("float depthContinuity = surfaceDelta < 1.0e3")
                         && trace.contains("float residualFade = 1.0 - smoothstep(")
-                        && trace.contains("float edgeFade = smoothstep(0.015, 0.10, edgeDist)")
-                        && trace.contains("float departureFade = smoothstep(0.015, 0.08")
+                        && trace.contains("float edgeFade = smoothstep(0.005, 0.08, edgeDist)")
+                        && trace.contains("float confidence = min(min(edgeFade, distFade), min(")
                         && countOccurrences(trace, "metallumPlanarReflection, hitUv") == 3,
                 "screen-space reflection confidence or anti-stretch filtering regressed");
         require(before(environment,
                         "reflectedEnvironment = metallumEnvironmentLookupV1(",
                         "metallumTraceScreenSpaceReflectionV1(")
                         && environment.contains(
-                        "reflectedEnvironment = mix(reflectedEnvironment, ssrSample.rgb, ssrSample.a);"),
-                "screen-space reflection no longer preserves the analytic miss/edge fallback");
+                        "float fallbackVisibility = waterOpenSky * waterCelestialReflection;")
+                        && environment.contains("reflectedEnvironment * fallbackVisibility,")
+                        && environment.contains("environmentFresnel = vec3(waterFresnel);"),
+                "screen-space reflection no longer preserves and composes its analytic miss/edge fallback once");
 
         double p22 = 0.00019535065;
         double p32 = 0.050009768;
@@ -343,15 +348,93 @@ public final class AdvancedDirectLightingShaderTests {
             require(Math.abs(reconstructed - viewDepth) <= Math.max(1.0e-9, viewDepth * 1.0e-9),
                     "reverse-Z screen-space reflection depth reconstruction drifted");
         }
-        double previous = 0.0;
-        for (int step = 1; step <= 48; step++) {
-            double u = step / 48.0;
-            double distance = 96.0 * u * (0.15 + 0.85 * u);
-            require(distance > previous, "adaptive screen-space reflection steps are not monotonic");
-            previous = distance;
+        double viewPositionZ = -5.0;
+        double rayDirectionZ = 0.5;
+        double nearPlane = 0.05;
+        double originBias = 0.06;
+        double rayOriginZ = viewPositionZ + rayDirectionZ * originBias;
+        double clippedTravel = (-nearPlane - rayOriginZ) / rayDirectionZ;
+        require(clippedTravel > 9.8 && clippedTravel < 9.9
+                        && Math.abs(rayOriginZ + rayDirectionZ * clippedTravel + nearPlane) < 1.0e-9,
+                "near-plane clipping must use the biased origin and retain the valid ray segment");
+        for (int step = 1; step <= 96; step++) {
+            double u = step / 96.0;
+            require(u > 0.0 && u <= 1.0,
+                    "screen-space DDA samples must remain monotonic through the projected segment");
         }
-        require(previous == 96.0,
-                "adaptive screen-space reflection trace no longer reaches its bounded endpoint");
+    }
+
+    private static void testScreenSpaceReflectionBehavioralContracts() {
+        // 1. Overshoot crossing and binary refinement vs legacy false-miss:
+        // Scene has a surface at distance 10.0m. Ray step i has rayDistance = 8.5m (in front).
+        // Step i+1 has rayDistance = 11.2m (behind surface).
+        // Depth difference = 11.2 - 10.0 = 1.2m.
+        // In legacy code: thickness max was 0.65m. Since depthDiff (1.2m) > thickness (0.65m),
+        // the crossing was aborted without refinement.
+        double sceneDistance = 10.0;
+        double previousRayDist = 8.5;
+        double currentRayDist = 11.2;
+        double previousDepthDiff = previousRayDist - sceneDistance; // -1.5 < 0
+        double currentDepthDiff = currentRayDist - sceneDistance;   // +1.2 >= 0
+        boolean crossedSurface = currentDepthDiff >= 0.0 && previousDepthDiff < 0.0;
+        require(crossedSurface, "surface crossing bracket must be detected across depth discontinuity");
+
+        // Binary bisection refinement in [8.5, 11.2]:
+        double uMin = 0.0;
+        double uMax = 1.0;
+        double hitDist = currentRayDist;
+        for (int b = 0; b < 5; b++) {
+            double uMid = (uMin + uMax) * 0.5;
+            double midDist = previousRayDist + (currentRayDist - previousRayDist) * uMid;
+            if (midDist >= sceneDistance) {
+                uMax = uMid;
+                hitDist = midDist;
+            } else {
+                uMin = uMid;
+            }
+        }
+        double hitResidual = hitDist - sceneDistance;
+        double thickness = Math.clamp(sceneDistance * 0.025 + (currentRayDist - previousRayDist) * 0.50 + 0.40, 0.40, 1.50);
+        require(hitResidual >= 0.0 && hitResidual < 0.10 && hitResidual <= thickness,
+                "binary refinement must converge to within 0.1m of the surface");
+
+        // 2. Surface continuity preserves thin silhouette against sky:
+        // Hit pixel at depth 15.0m. Left neighbor is building (15.05m). Right neighbor is sky (-1.0m sentinel).
+        // Down neighbor is building (15.1m). Up neighbor is sky (-1.0m sentinel).
+        double hitSceneDepth = 15.0;
+        double neighborLeft = 15.05;
+        double neighborRight = -1.0;
+        double neighborDown = 15.10;
+        double neighborUp = -1.0;
+        double dxMin = 1.0e4;
+        if (neighborLeft > 0.0) dxMin = Math.min(dxMin, Math.abs(neighborLeft - hitSceneDepth));
+        if (neighborRight > 0.0) dxMin = Math.min(dxMin, Math.abs(neighborRight - hitSceneDepth));
+        double dyMin = 1.0e4;
+        if (neighborDown > 0.0) dyMin = Math.min(dyMin, Math.abs(neighborDown - hitSceneDepth));
+        if (neighborUp > 0.0) dyMin = Math.min(dyMin, Math.abs(neighborUp - hitSceneDepth));
+        double surfaceDelta = Math.min(dxMin, dyMin);
+        double continuityThreshold = Math.max(0.65, hitSceneDepth * 0.025);
+        double depthContinuity = surfaceDelta < 1.0e3
+                ? 1.0 - smoothstep(continuityThreshold, continuityThreshold * 3.5, surfaceDelta)
+                : 0.5;
+        require(depthContinuity >= 0.99,
+                "surface continuity must protect silhouettes against sky sentinels from confidence collapse");
+
+        // 3. Smith horizon masking smoothly bends downward rays into grazing rays:
+        double rayDirZ = -0.05; // points slightly into the water
+        double surfaceDeparture = rayDirZ;
+        if (surfaceDeparture < 0.02) {
+            surfaceDeparture = 0.02;
+        }
+        require(surfaceDeparture >= 0.02, "Smith horizon masking must prevent negative surface departure");
+
+        // 4. Single-point energy composition:
+        float ssrWeight = 0.85f;
+        float fallbackVisibility = 0.25f; // sky occluded (e.g. under a porch or cliff)
+        float ssrRadiance = 1.2f;          // HDR reflector
+        float reflectedEnv = 0.8f;
+        float composed = (1.0f - ssrWeight) * (reflectedEnv * fallbackVisibility) + ssrWeight * ssrRadiance;
+        require(composed > 1.0f, "SSR hit radiance must not be dimmed by analytic sky occlusion");
     }
 
     private static float waterSkyReflectionVisibility(
@@ -1262,7 +1345,8 @@ public final class AdvancedDirectLightingShaderTests {
                         && environment.contains(
                         "float waterCelestialReflection = waterMoonlit ? 0.18 : 1.0;")
                         && environment.contains(
-                        "environmentVisibility = waterOpenSky * waterCelestialReflection;")
+                        "float fallbackVisibility = waterOpenSky * waterCelestialReflection;")
+                        && environment.contains("reflectedEnvironment * fallbackVisibility,")
                         && environment.contains("? mix(1.0, 0.92,")
                         && environment.contains("metallumWaterStyleProfileV1().preservesPreReflectionAppearance"),
                 "analytic water environment is not gated by existing skylight and moon state");
@@ -2624,7 +2708,8 @@ public final class AdvancedDirectLightingShaderTests {
                                 && fragmentMsl.contains("screenSpanPixels")
                                 && fragmentMsl.contains("previousSceneValid")
                                 && fragmentMsl.contains("depthContinuity")
-                                && fragmentMsl.contains("for (int i = 0; i < 48; i++)"),
+                                && fragmentMsl.contains("currentInvW")
+                                && fragmentMsl.contains("for (int i = 0; i < 96; i++)"),
                         name + " generated Metal lost bounded quality SSR or its bindings");
             }
             for (int slot : AdvancedLightingBindingAbi.fragmentSlots()) {

@@ -4383,3 +4383,41 @@ claiming visual acceptance.
    - Полноценный селектор `WaterReflectionMode` (`OFF`, `VOXELS`, `SCREEN_SPACE`) на выделенной странице `Metallum Reflections` с английской и русской локализацией.
 
 ---
+
+## 2026-09-25 — Stage SSR-4: Screen-Space Reflections (SSR) Quality Upgrade & Coordinate/Optics Overhaul — PASS
+
+**Статус:** Качественная переработка алгоритма SSR согласно плану `SSR_AUDIT_AND_TERRA_PLAN.md`.
+
+### Историческая оговорка к записи SSR-3 (2026-09-01)
+Запись SSR-3 от 2026-09-01 фиксировала ранний 16-шаговый прототип в view space с предварительным скринингом (300+300 кадров) на маршруте `reflection-water-view-a`. Последующий аудит выявил, что старый маршрут не обеспечивал достаточную видимость воды, а эвристики отсечения лучей (в частности, near-plane clipping и перемножение 6 штрафных факторов confidence) скрывали дефекты геометрии и приводили к полосам («зебре») и стиранию силуэтов на скользящих углах. Данное обновление устраняет фундаментальные математические и оптические дефекты трассировки.
+
+### Реализованные изменения по фазам аудита P0–P6
+
+1. **P0 Lifecycle, Admission & Teardown**:
+   - `ScreenSpaceReflectionRenderer`: разделены `shouldCapture()` / `isTraceRequested()` и `isCaptureValid()` / `isTracingEnabled()`. Теперь диагностический режим `metallum.ssr.capture_only` выполняет копию сцены, но гарантирует, что шейдер остаётся на analytic fallback пути (1x1 fallback depth).
+   - Внедрена структурированная телеметрия `AdmissionSnapshot` и логгер `SSR_ADMISSION` без per-frame GPU readback.
+   - `destroy()` подключен к жизненному циклу устройства (`PlanarReflectionRenderer.close()` / `MetalDevice.close()`).
+
+2. **P1 Coordinates & Ray Segment Clipping**:
+   - Исправлен порядок near-plane clipping: сначала применяется world-space origin bias, затем оставшийся отрезок луча отсекается против near-plane $Z = -nearPlane$ по формуле $(-nearPlane - rayOrigin.z) / rayDirection.z$.
+   - Введено отсечение экранного 2D-отрезка луча строго по границам кадра $[0.002, 0.998]$ с линейной интерполяцией гомогенных координат ($1/W$, $Q/W$). Это исключает ложные сбои проекции и выход DDA за пределы буфера.
+   - Введена per-fragment субпиксельная коррекция jitter/bobbing из `gl_FragCoord.xy` против stable view projection для устранения смещения отражения при движении камеры.
+
+3. **P2 Perspective-Correct Screen-Space DDA & Bracket Refinement**:
+   - Заменён квадратичный view-space stepping на перспективно корректный screen-space DDA (по методологии McGuire & Mara), интерполирующий $Q/W$ и $1/W$ линейно в экранных пикселях с лимитом `MAX_STEP_COUNT = 96`.
+   - Введён 5-итерационный бинарный поиск (refinement), выполняемый внутри найденного интервала $[u_i, u_{i+1}]$ без повторных матричных умножений.
+   - Динамический допуск толщины блоков: $\text{thickness} = \text{clamp}(\text{sceneDistance} \times 0.025 + \text{depthAdvance} \times 0.50 + 0.40, 0.40, 1.50)$ надёжно захватывает цельные 1-метровые блоки Minecraft и предотвращает пропуск пересечений при overshoot.
+
+4. **P3 Wave Footprint Filtering, Silhouette Continuity & Optics**:
+   - Фильтрация нормали ряби по экранному футпринту на удалении и скользящих углах (`mix(waveNormal, stableFlatNormal, waveFilter)`): убирает высокочастотный алиасинг ряби без потери живой формы волн вблизи.
+   - Smith horizon masking: лучи, направленные вглубь воды из-за наклона волны, плавно отклоняются вдоль касательной плоскости ($surfaceDeparture \ge 0.02$), предотвращая чередование полос hit/miss на гребнях и впадинах волн.
+   - Оценка непрерывности поверхности `depthContinuity` переведена на поиск минимального перепада по главным осям ($\min(dxMin, dyMin)$), что предотвращает стирание силуэтов зданий, столбов и крыш на фоне неба.
+   - Единая физическая композиция энергии: квадратичный Френель $F = \text{clamp}(0.06 + 0.84 \cdot (1 - \vec{N}\cdot\vec{V})^2, 0.06, 0.88)$ и однократное смешивание `mix(reflectedEnvironment * fallbackVisibility, ssrRadiance, ssrWeight)` обеспечивают сочный, читаемый цвет отражений без двойного демпфирования окклюзией неба.
+   - Субпиксельный 3-точечный реконструкционный фильтр вдоль ортогональной к лучу оси (`filterAxis`) устраняет растровую ступенчатость.
+
+5. **Конфигурация и верификация**:
+   - `config/metallum-reflections.properties` и `run/config/metallum-reflections.properties` переведены на `water_reflection_mode=screen_space`.
+   - Новые поведенческие тесты `testScreenSpaceReflectionBehavioralContracts()` добавлены в `AdvancedDirectLightingShaderTests`.
+   - Полный сьют `./gradlew check` (137 задач, включая нативные тесты Metal и компиляцию шейдеров) пройден со 100% успехом.
+
+---

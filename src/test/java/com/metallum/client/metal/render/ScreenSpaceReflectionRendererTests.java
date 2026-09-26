@@ -28,6 +28,8 @@ public final class ScreenSpaceReflectionRendererTests {
             System.setProperty(WaterReflectionConfig.PROPERTY_MODE, "off");
             require(!ScreenSpaceReflectionRenderer.shouldCapture(),
                     "OFF mode must not request scene capture");
+            require(!ScreenSpaceReflectionRenderer.isTraceRequested(),
+                    "OFF mode must not request screen-space tracing");
 
             System.setProperty(WaterReflectionConfig.PROPERTY_MODE, "voxels");
             require(!ScreenSpaceReflectionRenderer.shouldCapture(),
@@ -36,6 +38,8 @@ public final class ScreenSpaceReflectionRendererTests {
             System.setProperty(WaterReflectionConfig.PROPERTY_MODE, "screen_space");
             require(ScreenSpaceReflectionRenderer.shouldCapture(),
                     "SCREEN_SPACE mode must request scene capture");
+            require(ScreenSpaceReflectionRenderer.isTraceRequested(),
+                    "SCREEN_SPACE mode must request screen-space tracing");
         } finally {
             restoreProperty(WaterReflectionConfig.PROPERTY_MODE, override);
             restoreProperty(ScreenSpaceReflectionRenderer.PROPERTY_CAPTURE_ONLY, captureOnly);
@@ -51,6 +55,10 @@ public final class ScreenSpaceReflectionRendererTests {
             System.setProperty(ScreenSpaceReflectionRenderer.PROPERTY_CAPTURE_ONLY, "true");
             require(ScreenSpaceReflectionRenderer.shouldCapture(),
                     "metallum.ssr.capture_only=true must force capture even when mode is OFF");
+            require(!ScreenSpaceReflectionRenderer.isTraceRequested(),
+                    "capture_only must not make OFF mode request screen-space tracing");
+            require(!ScreenSpaceReflectionRenderer.isTracingEnabled(),
+                    "capture_only must not activate tracing before or after a capture");
 
             System.setProperty(ScreenSpaceReflectionRenderer.PROPERTY_CAPTURE_ONLY, "false");
             require(!ScreenSpaceReflectionRenderer.shouldCapture(),
@@ -64,12 +72,12 @@ public final class ScreenSpaceReflectionRendererTests {
 
     private static void testNullSafetyAndGuards() {
         ScreenSpaceReflectionRenderer.beginFrame();
-        require(!ScreenSpaceReflectionRenderer.isCaptureActive(),
+        require(!ScreenSpaceReflectionRenderer.isCaptureValid(),
                 "capture must not be active before any frame passes execute");
 
         // Null target must fail closed without throwing
         ScreenSpaceReflectionRenderer.captureOpaqueScene(null);
-        require(!ScreenSpaceReflectionRenderer.isCaptureActive(),
+        require(!ScreenSpaceReflectionRenderer.isCaptureValid(),
                 "capturing null target must fail closed");
 
         require(ScreenSpaceReflectionRenderer.capturedColorTexture() == null,
@@ -84,9 +92,9 @@ public final class ScreenSpaceReflectionRendererTests {
 
     private static void testFrameLifecycle() {
         ScreenSpaceReflectionRenderer.beginFrame();
-        require(!ScreenSpaceReflectionRenderer.isCaptureActive(), "beginFrame must clear active state");
+        require(!ScreenSpaceReflectionRenderer.isCaptureValid(), "beginFrame must clear capture validity");
         ScreenSpaceReflectionRenderer.destroy();
-        require(!ScreenSpaceReflectionRenderer.isCaptureActive(), "destroy must clear active state");
+        require(!ScreenSpaceReflectionRenderer.isCaptureValid(), "destroy must clear capture validity");
         require(ScreenSpaceReflectionRenderer.target() == null, "target must be null after destroy");
     }
 

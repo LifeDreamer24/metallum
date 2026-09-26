@@ -1158,26 +1158,31 @@ public final class AdvancedDirectLightingShaderPatcher {
                 }
                 vec2 textureExtent = vec2(textureSize(metallumReflectionDepth, 0));
                 vec3 stableFlatNormal = metallumSafeNormalV1(flatNormal);
-                vec3 reflectionNormal = metallumSafeNormalV1(
-                        mix(stableFlatNormal, waveNormal, 0.35));
+
+                // Filter high-frequency wave normal toward the stable geometric plane
+                // based on camera distance and grazing angle. This prevents subpixel
+                // ripple aliasing and harsh checkerboarding at a distance without dulling
+                // local water ripples up close.
+                float distanceFade = smoothstep(8.0, 48.0, -viewPosition.z);
+                float grazingFade = smoothstep(0.40, 0.06, dot(stableFlatNormal, viewDirection));
+                float waveFilter = clamp(max(distanceFade, grazingFade) * 0.65, 0.0, 0.85);
+                vec3 reflectionNormal = metallumSafeNormalV1(mix(waveNormal, stableFlatNormal, waveFilter));
                 vec3 rayDirection = reflect(-viewDirection, reflectionNormal);
+
+                // Enforce minimum positive departure above the geometric water plane (Smith
+                // horizon masking). Facets pointing away from the camera graze along the surface
+                // rather than dipping into the water bed and being discarded as false misses.
                 float surfaceDeparture = dot(rayDirection, stableFlatNormal);
-                if (any(isnan(rayDirection)) || any(isinf(rayDirection))
-                        || surfaceDeparture <= 0.01) {
+                if (surfaceDeparture < 0.02) {
+                    rayDirection = normalize(rayDirection + (0.02 - surfaceDeparture) * stableFlatNormal);
+                    surfaceDeparture = 0.02;
+                }
+                if (any(isnan(rayDirection)) || any(isinf(rayDirection))) {
                     return vec4(0.0);
                 }
+
                 float p22 = metallumLighting.projection[2][2];
                 float p32 = metallumLighting.projection[3][2];
-                float nearPlane = max(metallumLighting.depth.x, 0.05);
-                float clippedMaxDistance = max(maxDistance, 0.0);
-                if (rayDirection.z > 0.0) {
-                    clippedMaxDistance = min(
-                            clippedMaxDistance,
-                            (-nearPlane - viewPosition.z) / rayDirection.z);
-                }
-                if (clippedMaxDistance <= 0.20) {
-                    return vec4(0.0);
-                }
 
                 // The depth snapshot was rendered with the final world projection, while the
                 // shared lighting packet intentionally carries the stable camera projection.
@@ -1195,93 +1200,130 @@ public final class AdvancedDirectLightingShaderPatcher {
                 }
 
                 // The opaque snapshot contains the terrain below water, not the translucent
-                // water itself. A small ray-direction bias is therefore sufficient and avoids
-                // skipping nearby reflectors as the old depth-proportional start offset did.
+                // water itself. Bias first, then clip the *actual* ray origin against the same
+                // near-plane convention used for its homogeneous projection.
                 float originBias = clamp(-viewPosition.z * 0.0015, 0.06, 0.18);
                 vec3 rayOrigin = viewPosition + rayDirection * originBias;
+                float nearPlane = max(metallumLighting.depth.x, 0.05);
+                float clippedMaxDistance = max(maxDistance, 0.0);
+                if (rayDirection.z > 1.0e-6) {
+                    clippedMaxDistance = min(
+                            clippedMaxDistance,
+                            (-nearPlane - rayOrigin.z) / rayDirection.z);
+                }
+                if (clippedMaxDistance <= 0.20) {
+                    return vec4(0.0);
+                }
                 vec4 originClip = metallumLighting.projection * vec4(rayOrigin, 1.0);
                 vec3 rayEnd = rayOrigin + rayDirection * clippedMaxDistance;
                 vec4 endClip = metallumLighting.projection * vec4(rayEnd, 1.0);
-                if (originClip.w <= 0.05 || endClip.w <= 0.05) {
+                if (originClip.w <= 1.0e-6 || endClip.w <= 1.0e-6) {
                     return vec4(0.0);
                 }
-                vec2 originUv = originClip.xy / originClip.w * 0.5 + 0.5
+                float originInvW = 1.0 / originClip.w;
+                float endInvW = 1.0 / endClip.w;
+                vec3 originQ = rayOrigin * originInvW;
+                vec3 endQ = rayEnd * endInvW;
+                vec2 originUv = originClip.xy * originInvW * 0.5 + 0.5
                         + projectionUvCorrection;
-                vec2 endUv = endClip.xy / endClip.w * 0.5 + 0.5
+                vec2 endUv = endClip.xy * endInvW * 0.5 + 0.5
                         + projectionUvCorrection;
                 if (any(lessThan(originUv, vec2(0.001)))
                         || any(greaterThan(originUv, vec2(0.999)))) {
                     return vec4(0.0);
                 }
-                float screenSpanPixels = length((endUv - originUv) * textureExtent);
-                int stepCount = int(clamp(ceil(screenSpanPixels * 0.20), 24.0, 48.0));
+
+                // Clip the screen-space ray segment strictly to the visible screen boundary [0.002, 0.998].
+                // This guarantees every step of the DDA lands on-screen, preventing wasted off-screen steps
+                // or false ray termination from unbounded projections.
+                vec2 minBorder = vec2(0.002);
+                vec2 maxBorder = vec2(0.998);
+                vec2 dUv = endUv - originUv;
+                float clipAlpha = 1.0;
+                if (endUv.x < minBorder.x && dUv.x < -1.0e-6) clipAlpha = min(clipAlpha, (minBorder.x - originUv.x) / dUv.x);
+                if (endUv.x > maxBorder.x && dUv.x > 1.0e-6) clipAlpha = min(clipAlpha, (maxBorder.x - originUv.x) / dUv.x);
+                if (endUv.y < minBorder.y && dUv.y < -1.0e-6) clipAlpha = min(clipAlpha, (minBorder.y - originUv.y) / dUv.y);
+                if (endUv.y > maxBorder.y && dUv.y > 1.0e-6) clipAlpha = min(clipAlpha, (maxBorder.y - originUv.y) / dUv.y);
+                clipAlpha = clamp(clipAlpha, 0.0, 1.0);
+                if (clipAlpha <= 0.001) {
+                    return vec4(0.0);
+                }
+                endUv = originUv + dUv * clipAlpha;
+                endInvW = mix(originInvW, endInvW, clipAlpha);
+                endQ = mix(originQ, endQ, clipAlpha);
+
+                vec2 raySpanPixels = abs((endUv - originUv) * textureExtent);
+                float screenSpanPixels = max(raySpanPixels.x, raySpanPixels.y);
+                if (screenSpanPixels < 1.0) {
+                    return vec4(0.0);
+                }
+
+                // Perspective-correct screen-space DDA:
+                // One step covers at most a few dominant-axis raster pixels, bounded by MAX_STEP_COUNT.
+                // Binary refinement subdivides the bracketed interval by 32x to achieve sub-pixel hit precision.
+                const int MAX_STEP_COUNT = 96;
+                int stepCount = int(clamp(ceil(screenSpanPixels), 1.0, float(MAX_STEP_COUNT)));
 
                 float originRawDepth = texture(metallumReflectionDepth, originUv).r;
                 float originSceneDepth = metallumSsrViewDepthV1(originRawDepth, p22, p32);
                 bool previousSceneValid = originSceneDepth > 0.0;
                 float previousDepthDiff = -rayOrigin.z - originSceneDepth;
                 vec3 previousRayPos = rayOrigin;
-                const int MAX_STEP_COUNT = 48;
                 for (int i = 0; i < MAX_STEP_COUNT; i++) {
                     if (i >= stepCount) {
                         break;
                     }
                     float u = float(i + 1) / float(stepCount);
-                    // Quadratic spacing spends most samples close to the receiver, where a
-                    // one-block Minecraft silhouette would otherwise fit inside a single step.
-                    float rayTravel = clippedMaxDistance * u * (0.15 + 0.85 * u);
-                    vec3 currentRayPos = rayOrigin + rayDirection * rayTravel;
+                    // Interpolate homogeneous quantities (Q/w and 1/w) linearly in screen space,
+                    // reconstructing true perspective-correct view-space coordinates at each sample.
+                    float currentInvW = mix(originInvW, endInvW, u);
+                    vec3 currentRayPos = mix(originQ, endQ, u) / max(currentInvW, 1.0e-6);
                     if (currentRayPos.z >= -0.1) {
                         break;
                     }
-                    vec4 clipPos = metallumLighting.projection * vec4(currentRayPos, 1.0);
-                    if (clipPos.w <= 0.05) {
-                        break;
-                    }
-                    vec2 sampleUv = clipPos.xy / clipPos.w * 0.5 + 0.5
-                            + projectionUvCorrection;
-                    if (sampleUv.x < 0.001 || sampleUv.x > 0.999 || sampleUv.y < 0.001 || sampleUv.y > 0.999) {
-                        break;
-                    }
+                    vec2 sampleUv = mix(originUv, endUv, u);
+
                     float rawDepth = texture(metallumReflectionDepth, sampleUv).r;
                     float sceneDistance = metallumSsrViewDepthV1(rawDepth, p22, p32);
                     if (sceneDistance > 0.0) {
                         float rayDistance = -currentRayPos.z;
                         float depthDiff = rayDistance - sceneDistance;
-                        float depthAdvance = abs(rayDistance + previousRayPos.z);
+                        float depthAdvance = abs(rayDistance - (-previousRayPos.z));
+                        // Depth thickness tolerance: accommodates solid Minecraft blocks (>=1.0m)
+                        // and prevents foreground edge bleeding over large scene depth discontinuities.
                         float thickness = clamp(
-                                depthAdvance * 1.10 + sceneDistance * 0.0025,
-                                0.10,
-                                0.65);
+                                sceneDistance * 0.025 + depthAdvance * 0.50 + 0.40,
+                                0.40,
+                                1.50);
                         bool crossedSurface = depthDiff >= 0.0
                                 && ((previousSceneValid && previousDepthDiff < 0.0)
-                                || (!previousSceneValid && depthDiff <= thickness * 0.25));
-                        if (crossedSurface && depthDiff <= thickness) {
-                            vec3 minPos = previousRayPos;
-                            vec3 maxPos = currentRayPos;
+                                || (!previousSceneValid && depthDiff <= thickness * 0.50));
+                        if (crossedSurface) {
+                            // Perspective-correct binary bisection within the bracket [i, i+1]
+                            float uMin = float(i) / float(stepCount);
+                            float uMax = u;
                             vec2 hitUv = sampleUv;
+                            vec3 hitPos = currentRayPos;
                             for (int b = 0; b < 5; b++) {
-                                vec3 midPos = mix(minPos, maxPos, 0.5);
-                                if (midPos.z >= -0.1) break;
-                                vec4 midClip = metallumLighting.projection * vec4(midPos, 1.0);
-                                if (midClip.w <= 0.05) break;
-                                vec2 midUv = midClip.xy / midClip.w * 0.5 + 0.5
-                                        + projectionUvCorrection;
+                                float uMid = (uMin + uMax) * 0.5;
+                                float midInvW = mix(originInvW, endInvW, uMid);
+                                vec3 midPos = mix(originQ, endQ, uMid) / max(midInvW, 1.0e-6);
+                                vec2 midUv = mix(originUv, endUv, uMid);
                                 float midRaw = texture(metallumReflectionDepth, midUv).r;
                                 float midScene = metallumSsrViewDepthV1(midRaw, p22, p32);
                                 if (midScene <= 0.0) {
-                                    minPos = midPos;
+                                    uMin = uMid;
                                 } else if (-midPos.z >= midScene) {
-                                    maxPos = midPos;
+                                    uMax = uMid;
                                     hitUv = midUv;
+                                    hitPos = midPos;
                                 } else {
-                                    minPos = midPos;
+                                    uMin = uMid;
                                 }
                             }
                             float hitRawDepth = texture(metallumReflectionDepth, hitUv).r;
-                            float hitSceneDepth = metallumSsrViewDepthV1(
-                                    hitRawDepth, p22, p32);
-                            float hitResidual = max(-maxPos.z - hitSceneDepth, 0.0);
+                            float hitSceneDepth = metallumSsrViewDepthV1(hitRawDepth, p22, p32);
+                            float hitResidual = max(-hitPos.z - hitSceneDepth, 0.0);
                             if (hitSceneDepth <= 0.0 || hitResidual > thickness) {
                                 previousRayPos = currentRayPos;
                                 previousDepthDiff = depthDiff;
@@ -1289,55 +1331,52 @@ public final class AdvancedDirectLightingShaderPatcher {
                                 continue;
                             }
 
-                            // A depth-only SSR cannot validate the hit normal. Reject the common
-                            // silhouette-stretching failure by fading discontinuous 4-neighbours.
+                            // Best-fit local surface continuity filter:
+                            // Validates that the hit pixel belongs to a continuous local surface rather
+                            // than an isolated depth artifact or backface sliver.
+                            // Evaluates the best neighbor along each axis to protect silhouette edges
+                            // against the sky from artificial erasure.
                             vec2 texelSize = vec2(1.0) / textureExtent;
                             float neighborLeft = metallumSsrViewDepthV1(texture(
-                                    metallumReflectionDepth, hitUv - vec2(texelSize.x, 0.0)).r,
-                                    p22, p32);
+                                    metallumReflectionDepth, hitUv - vec2(texelSize.x, 0.0)).r, p22, p32);
                             float neighborRight = metallumSsrViewDepthV1(texture(
-                                    metallumReflectionDepth, hitUv + vec2(texelSize.x, 0.0)).r,
-                                    p22, p32);
+                                    metallumReflectionDepth, hitUv + vec2(texelSize.x, 0.0)).r, p22, p32);
                             float neighborDown = metallumSsrViewDepthV1(texture(
-                                    metallumReflectionDepth, hitUv - vec2(0.0, texelSize.y)).r,
-                                    p22, p32);
+                                    metallumReflectionDepth, hitUv - vec2(0.0, texelSize.y)).r, p22, p32);
                             float neighborUp = metallumSsrViewDepthV1(texture(
-                                    metallumReflectionDepth, hitUv + vec2(0.0, texelSize.y)).r,
-                                    p22, p32);
-                            float depthContinuity = 0.0;
-                            if (min(min(neighborLeft, neighborRight),
-                                    min(neighborDown, neighborUp)) > 0.0) {
-                                float largestNeighborDelta = max(max(
-                                        abs(neighborLeft - hitSceneDepth),
-                                        abs(neighborRight - hitSceneDepth)), max(
-                                        abs(neighborDown - hitSceneDepth),
-                                        abs(neighborUp - hitSceneDepth)));
-                                float continuityStart = max(0.45, hitSceneDepth * 0.010);
-                                depthContinuity = 1.0 - smoothstep(
-                                        continuityStart,
-                                        continuityStart * 4.0,
-                                        largestNeighborDelta);
-                            }
+                                    metallumReflectionDepth, hitUv + vec2(0.0, texelSize.y)).r, p22, p32);
+
+                            float dxMin = 1.0e4;
+                            if (neighborLeft > 0.0) dxMin = min(dxMin, abs(neighborLeft - hitSceneDepth));
+                            if (neighborRight > 0.0) dxMin = min(dxMin, abs(neighborRight - hitSceneDepth));
+                            float dyMin = 1.0e4;
+                            if (neighborDown > 0.0) dyMin = min(dyMin, abs(neighborDown - hitSceneDepth));
+                            if (neighborUp > 0.0) dyMin = min(dyMin, abs(neighborUp - hitSceneDepth));
+                            float surfaceDelta = min(dxMin, dyMin);
+                            float continuityThreshold = max(0.65, hitSceneDepth * 0.025);
+                            float depthContinuity = surfaceDelta < 1.0e3
+                                    ? 1.0 - smoothstep(continuityThreshold, continuityThreshold * 3.5, surfaceDelta)
+                                    : 0.5;
+
                             float edgeDist = min(min(hitUv.x, hitUv.y), min(1.0 - hitUv.x, 1.0 - hitUv.y));
-                            float edgeFade = smoothstep(0.015, 0.10, edgeDist);
-                            float distFade = 1.0 - smoothstep(0.68, 0.98, u);
-                            float residualFade = 1.0 - smoothstep(
-                                    thickness * 0.20, thickness, hitResidual);
+                            float edgeFade = smoothstep(0.005, 0.08, edgeDist);
+                            float distFade = 1.0 - smoothstep(0.75, 1.0, u * clipAlpha);
+                            float residualFade = 1.0 - smoothstep(thickness * 0.35, thickness, hitResidual);
                             float screenTravel = length((hitUv - originUv) * textureExtent);
-                            float travelFade = smoothstep(2.0, 8.0, screenTravel);
-                            float departureFade = smoothstep(0.015, 0.08, surfaceDeparture);
-                            float confidence = edgeFade * distFade * residualFade
-                                    * travelFade * departureFade * depthContinuity;
+                            float travelFade = smoothstep(1.5, 6.0, screenTravel);
+
+                            float confidence = min(min(edgeFade, distFade), min(residualFade, travelFade)) * depthContinuity;
                             if (confidence <= 0.001) {
                                 return vec4(0.0);
                             }
 
-                            // Filter across, not along, the screen-space ray. This removes the
-                            // last single-pixel stair-step without elongating the reflected shape.
+                            // Subpixel cross-ray reconstruction filter:
+                            // Samples across the projected ray direction to remove raster stair-stepping
+                            // without elongating or blurring the reflected feature along its path.
                             vec2 screenDirection = (hitUv - originUv)
                                     / max(length(hitUv - originUv), 1.0e-6);
                             vec2 filterAxis = vec2(-screenDirection.y, screenDirection.x)
-                                    * texelSize * mix(0.65, 1.25, u);
+                                    * texelSize * mix(0.60, 1.10, u);
                             vec3 sceneColor = texture(
                                     metallumPlanarReflection, hitUv).rgb * 0.50;
                             sceneColor += texture(
@@ -1396,15 +1435,17 @@ public final class AdvancedDirectLightingShaderPatcher {
                             min(reflectionUv.x, reflectionUv.y),
                             min(1.0 - reflectionUv.x, 1.0 - reflectionUv.y));
                     float ssrWeight = 0.0;
+                    vec3 ssrRadiance = vec3(0.0);
+                    // Trace and Fresnel both use the animated shading normal. The flat normal
+                    // remains only the geometric departure reference inside the trace helper.
+                    float waterFresnel = clamp(
+                            0.06 + 0.84 * pow(1.0 - nDotV, 2.0), 0.06, 0.88);
                     bool ssrActive = textureSize(metallumReflectionDepth, 0).x > 1;
                     if (ssrActive) {
                         vec4 ssrSample = metallumTraceScreenSpaceReflectionV1(
                                 viewPosition, viewDirection, flatWaterNormal, normal, 96.0);
-                        float ssrFresnel = clamp(
-                                0.04 + 0.96 * pow(1.0 - nDotV, 3.0), 0.04, 0.85);
                         if (ssrSample.a > 0.0) {
-                            reflectedEnvironment = mix(reflectedEnvironment, ssrSample.rgb, ssrSample.a);
-                            environmentFresnel = mix(environmentFresnel, vec3(ssrFresnel), ssrSample.a);
+                            ssrRadiance = ssrSample.rgb;
                             ssrWeight = ssrSample.a;
                         }
                     } else {
@@ -1432,8 +1473,16 @@ public final class AdvancedDirectLightingShaderPatcher {
                     float waterOpenSky = smoothstep(0.20, 0.85, skyOcclusion);
                     bool waterMoonlit = (metallumEnvironment.contract.w & 2u) != 0u;
                     float waterCelestialReflection = waterMoonlit ? 0.18 : 1.0;
-                    environmentVisibility = waterOpenSky * waterCelestialReflection;
-                    environmentVisibility = mix(environmentVisibility, 1.0, ssrWeight);
+                    float fallbackVisibility = waterOpenSky * waterCelestialReflection;
+                    // Compose SSR and the analytic miss fallback exactly once. Confidence is a
+                    // hit-confidence, so it must not also dim an already lit SSR sample via the
+                    // analytic-sky visibility term.
+                    reflectedEnvironment = mix(
+                            reflectedEnvironment * fallbackVisibility,
+                            ssrRadiance,
+                            ssrWeight);
+                    environmentFresnel = vec3(waterFresnel);
+                    environmentVisibility = 1.0;
                 }
                 float environmentStyleWeight = material.kind == METALLUM_SURFACE_WATER_V1
                         ? mix(1.0, 0.92,
@@ -3444,15 +3493,17 @@ public final class AdvancedDirectLightingShaderPatcher {
                             min(reflectionUv.x, reflectionUv.y),
                             min(1.0 - reflectionUv.x, 1.0 - reflectionUv.y));
                     float ssrWeight = 0.0;
+                    vec3 ssrRadiance = vec3(0.0);
+                    // Trace and Fresnel both use the animated shading normal. The flat normal
+                    // remains only the geometric departure reference inside the trace helper.
+                    float waterFresnel = clamp(
+                            0.06 + 0.84 * pow(1.0 - nDotV, 2.0), 0.06, 0.88);
                     bool ssrActive = textureSize(metallumReflectionDepth, 0).x > 1;
                     if (ssrActive) {
                         vec4 ssrSample = metallumTraceScreenSpaceReflectionV1(
                                 viewPosition, viewDirection, flatWaterNormal, normal, 96.0);
-                        float ssrFresnel = clamp(
-                                0.04 + 0.96 * pow(1.0 - nDotV, 3.0), 0.04, 0.85);
                         if (ssrSample.a > 0.0) {
-                            reflectedEnvironment = mix(reflectedEnvironment, ssrSample.rgb, ssrSample.a);
-                            environmentFresnel = mix(environmentFresnel, vec3(ssrFresnel), ssrSample.a);
+                            ssrRadiance = ssrSample.rgb;
                             ssrWeight = ssrSample.a;
                         }
                     } else {
@@ -3480,8 +3531,16 @@ public final class AdvancedDirectLightingShaderPatcher {
                     float waterOpenSky = smoothstep(0.20, 0.85, skyOcclusion);
                     bool waterMoonlit = (metallumEnvironment.contract.w & 2u) != 0u;
                     float waterCelestialReflection = waterMoonlit ? 0.18 : 1.0;
-                    environmentVisibility = waterOpenSky * waterCelestialReflection;
-                    environmentVisibility = mix(environmentVisibility, 1.0, ssrWeight);
+                    float fallbackVisibility = waterOpenSky * waterCelestialReflection;
+                    // Compose SSR and the analytic miss fallback exactly once. Confidence is a
+                    // hit-confidence, so it must not also dim an already lit SSR sample via the
+                    // analytic-sky visibility term.
+                    reflectedEnvironment = mix(
+                            reflectedEnvironment * fallbackVisibility,
+                            ssrRadiance,
+                            ssrWeight);
+                    environmentFresnel = vec3(waterFresnel);
+                    environmentVisibility = 1.0;
                 }
                 float environmentStyleWeight = material.kind == METALLUM_SURFACE_WATER_V1
                         ? mix(1.0, 0.92,

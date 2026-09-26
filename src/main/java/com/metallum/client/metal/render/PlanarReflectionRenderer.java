@@ -646,6 +646,10 @@ public final class PlanarReflectionRenderer {
     }
 
     public static void close() {
+        // SSR owns static snapshots and samplers independently of the optional planar target.
+        // Device close waits for submitted GPU work before reaching this path, so this is the
+        // single lifecycle point for both reflection implementations and recreation is clean.
+        ScreenSpaceReflectionRenderer.destroy();
         if (resources != null) {
             resources.close();
             resources = null;

@@ -1,5 +1,6 @@
 package com.metallum.client.metal.render;
 
+import com.metallum.Metallum;
 import com.metallum.client.lighting.reflection.WaterReflectionConfig;
 import com.metallum.client.lighting.shader.AdvancedDirectLightingShaderPatcher;
 import com.metallum.client.lighting.shader.PlanarReflectionBindingAbi;
@@ -30,7 +31,8 @@ public final class ScreenSpaceReflectionRenderer {
     private static int targetHeight;
     private static GpuFormat targetFormat;
     private static boolean capturedThisFrame;
-    private static boolean activeThisFrame;
+    private static boolean captureValidThisFrame;
+    private static String lastAdmissionSignature;
 
     private static MetalGpuTexture fallbackDepthTexture;
     private static MetalGpuSampler linearClampSampler;
@@ -40,35 +42,54 @@ public final class ScreenSpaceReflectionRenderer {
     }
 
     public static boolean shouldCapture() {
-        return WaterReflectionConfig.isScreenSpaceActive()
-                || Boolean.getBoolean(PROPERTY_CAPTURE_ONLY);
+        return isTraceRequested() || Boolean.getBoolean(PROPERTY_CAPTURE_ONLY);
+    }
+
+    /**
+     * Whether the user selected the screen-space reflection mode. Capture-only deliberately does
+     * not participate: it is a copy-path diagnostic and must never make the water shader trace.
+     */
+    public static boolean isTraceRequested() {
+        return WaterReflectionConfig.isScreenSpaceActive();
     }
 
     public static void beginFrame() {
         capturedThisFrame = false;
-        activeThisFrame = false;
+        captureValidThisFrame = false;
     }
 
     public static void captureOpaqueScene(@Nullable final RenderTarget source) {
-        if (!shouldCapture() || capturedThisFrame || source == null) {
+        if (!shouldCapture()) {
+            reportAdmission(null, "capture_not_requested");
+            return;
+        }
+        if (capturedThisFrame) {
+            return;
+        }
+
+        if (source == null) {
+            reportAdmission(null, "source_missing");
             return;
         }
 
         GpuTexture colorSource = source.getColorTexture();
         GpuTexture depthSource = source.getDepthTexture();
         if (colorSource == null || depthSource == null) {
+            reportAdmission(null, "source_attachment_missing");
             return;
         }
 
         int width = colorSource.getWidth(0);
         int height = colorSource.getHeight(0);
         if (width <= 0 || height <= 0) {
+            reportAdmission(null, "source_extent_invalid");
             return;
         }
 
         GpuFormat format = colorSource.getFormat();
         MetalDevice device = MetalDevice.getInstance();
         if (device == null) {
+            reportAdmission(null, "metal_device_missing");
             return;
         }
         TextureTarget currentTarget = getOrCreateTarget(device, width, height, format);
@@ -82,7 +103,8 @@ public final class ScreenSpaceReflectionRenderer {
         );
 
         capturedThisFrame = true;
-        activeThisFrame = true;
+        captureValidThisFrame = true;
+        reportAdmission(device, isTracingEnabled() ? "ready" : "capture_only");
     }
 
     private static TextureTarget getOrCreateTarget(
@@ -158,7 +180,7 @@ public final class ScreenSpaceReflectionRenderer {
         }
         ensureStaticResources(device);
 
-        if (isCaptureActive() && target != null) {
+        if (isTracingEnabled() && target != null) {
             MetalGpuTexture color = (MetalGpuTexture) target.getColorTexture();
             MetalGpuTexture depth = (MetalGpuTexture) target.getDepthTexture();
             if (color != null && !color.isClosed() && depth != null && !depth.isClosed()) {
@@ -188,8 +210,24 @@ public final class ScreenSpaceReflectionRenderer {
         }
     }
 
+    /** True only after an opaque snapshot was copied successfully in this rendered frame. */
+    public static boolean isCaptureValid() {
+        return captureValidThisFrame && target != null;
+    }
+
+    /**
+     * The only condition that permits full-resolution scene bindings to activate the SSR shader.
+     * Keeping this distinct from {@link #isCaptureValid()} makes OFF/capture-only measurements
+     * honest: a 1x1 fallback depth stays bound and the shader takes its analytic fallback path.
+     */
+    public static boolean isTracingEnabled() {
+        return isTraceRequested() && isCaptureValid();
+    }
+
+    /** @deprecated Use {@link #isCaptureValid()} or {@link #isTracingEnabled()} explicitly. */
+    @Deprecated(forRemoval = false)
     public static boolean isCaptureActive() {
-        return activeThisFrame && target != null;
+        return isCaptureValid();
     }
 
     public static @Nullable GpuTexture capturedColorTexture() {
@@ -233,6 +271,59 @@ public final class ScreenSpaceReflectionRenderer {
             pointClampSampler = null;
         }
         capturedThisFrame = false;
-        activeThisFrame = false;
+        captureValidThisFrame = false;
+        lastAdmissionSignature = null;
+    }
+
+    /** A stable, benchmark-readable admission snapshot without a GPU readback. */
+    public record AdmissionSnapshot(
+            long frameGeneration,
+            boolean captureRequested,
+            boolean captureValid,
+            boolean traceRequested,
+            boolean traceEnabled,
+            int width,
+            int height,
+            String format,
+            int colorSlot,
+            int depthSlot,
+            String reason
+    ) {
+    }
+
+    public static AdmissionSnapshot admissionSnapshot(final @Nullable MetalDevice device, final String reason) {
+        long frameGeneration = device != null ? device.currentSubmitIndex() : -1L;
+        return new AdmissionSnapshot(
+                frameGeneration,
+                shouldCapture(),
+                isCaptureValid(),
+                isTraceRequested(),
+                isTracingEnabled(),
+                targetWidth,
+                targetHeight,
+                targetFormat != null ? targetFormat.name() : "none",
+                PlanarReflectionBindingAbi.TEXTURE_SLOT,
+                AdvancedDirectLightingShaderPatcher.REFLECTION_DEPTH_SLOT,
+                reason
+        );
+    }
+
+    private static void reportAdmission(final @Nullable MetalDevice device, final String reason) {
+        AdmissionSnapshot snapshot = admissionSnapshot(device, reason);
+        String signature = snapshot.captureRequested() + ":" + snapshot.captureValid() + ":"
+                + snapshot.traceRequested() + ":" + snapshot.traceEnabled() + ":"
+                + snapshot.width() + "x" + snapshot.height() + ":" + snapshot.format() + ":" + reason;
+        if (signature.equals(lastAdmissionSignature)) {
+            return;
+        }
+        lastAdmissionSignature = signature;
+        Metallum.LOGGER.info(
+                "SSR_ADMISSION frame_generation={} capture_requested={} capture_valid={} "
+                        + "trace_requested={} trace_enabled={} extent={}x{} format={} "
+                        + "color_slot={} depth_slot={} reason={}",
+                snapshot.frameGeneration(), snapshot.captureRequested(), snapshot.captureValid(),
+                snapshot.traceRequested(), snapshot.traceEnabled(), snapshot.width(), snapshot.height(),
+                snapshot.format(), snapshot.colorSlot(), snapshot.depthSlot(), snapshot.reason()
+        );
     }
 }
