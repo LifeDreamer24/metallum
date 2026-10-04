@@ -8,6 +8,8 @@ run-name: ${{ github.ref_name }}
 on:
   workflow_dispatch:
   push:
+    branches:
+      - 'build/upstream-pr-24'
     tags:
       - 'v*'
 
