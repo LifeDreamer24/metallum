@@ -7,6 +7,7 @@ name: build
 run-name: ${{ github.ref_name }}
 on:
   workflow_dispatch:
+  pull_request:
   push:
     tags:
       - 'v*'
@@ -17,9 +18,18 @@ permissions:
 jobs:
   build:
     runs-on: macos-15
+    env:
+      # macos-15 defaults to Xcode 16, which lacks the Metal 4/macOS 26 APIs.
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
     steps:
       - name: checkout repository
         uses: actions/checkout@v6
+      - name: verify Apple toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          xcrun swiftc --version
+          xcrun --sdk macosx metal --version
       - name: validate gradle wrapper
         uses: gradle/actions/wrapper-validation@v6
       - name: setup jdk
