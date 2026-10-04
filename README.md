@@ -85,7 +85,13 @@ and connect safe per-object motion inputs.
 ## Build
 
 Building the native backend requires an Apple Silicon Mac, Java 25+, and Xcode
-with the macOS SDK, Swift and Metal command-line tools selected.
+26 or newer with the macOS 26+ SDK, Swift and Metal command-line tools selected.
+The macOS 26 SDK is required to compile the Metal 4 and frame-interpolation APIs;
+runtime availability checks do not let an older SDK compile these declarations.
+CI selects Xcode 26.3 explicitly. For a local build, select your installed Xcode
+with `sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer`
+(adjust the app name if needed), and verify it with `xcodebuild -version` and
+`xcrun --sdk macosx --show-sdk-version`.
 
 ```bash
 ./gradlew build

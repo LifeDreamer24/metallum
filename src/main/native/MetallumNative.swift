@@ -5984,16 +5984,16 @@ private func makeHdrAdaptiveStateBuffer(
 }
 
 private let metallumActualHdrSemanticResetMask: UInt64 =
-    (1 << 0)   // FIRST_FRAME
-    | (1 << 2) // WORLD_LOAD_UNLOAD
-    | (1 << 3) // DIMENSION_CHANGE
-    | (1 << 4) // TELEPORT
-    | (1 << 5) // CAMERA_CUT
-    | (1 << 8) // RENDER_CONTRACT_CHANGE
-    | (1 << 9) // LIGHTING_MODEL_CHANGE
-    | (1 << 10) // OUTPUT_MODE_CHANGE
-    | (1 << 12) // RESOURCE_PACK_SHADER_RELOAD
-    | (1 << 13) // VISUAL_STYLE_CHANGE
+    (UInt64(1) << 0)   // FIRST_FRAME
+    | (UInt64(1) << 2) // WORLD_LOAD_UNLOAD
+    | (UInt64(1) << 3) // DIMENSION_CHANGE
+    | (UInt64(1) << 4) // TELEPORT
+    | (UInt64(1) << 5) // CAMERA_CUT
+    | (UInt64(1) << 8) // RENDER_CONTRACT_CHANGE
+    | (UInt64(1) << 9) // LIGHTING_MODEL_CHANGE
+    | (UInt64(1) << 10) // OUTPUT_MODE_CHANGE
+    | (UInt64(1) << 12) // RESOURCE_PACK_SHADER_RELOAD
+    | (UInt64(1) << 13) // VISUAL_STYLE_CHANGE
 
 private func metallumActualHdrExposureRequiresReset(_ resetMask: UInt64) -> Bool {
     // Resize, internal render-scale/DRS, dynamic/sprint FOV and generic
@@ -11569,7 +11569,7 @@ public func metallum_MTLDevice_makeCommandQueue(
     _ device: MTLDevice,
     _ layer: CAMetalLayer
 ) -> UnsafeMutableRawPointer? {
-    return autoreleasepool {
+    return autoreleasepool { () -> UnsafeMutableRawPointer? in
         guard layer.device === device, let queue = device.makeCommandQueue() else {
             return nil
         }
@@ -12157,7 +12157,7 @@ public func metallum_create_sampler(
     _ lodMaxClamp: Double,
     _ lodBias: Double
 ) -> UnsafeMutableRawPointer? {
-    return autoreleasepool {
+    return autoreleasepool { () -> UnsafeMutableRawPointer? in
         let descriptor = MTLSamplerDescriptor()
         descriptor.minFilter = minFilter
         descriptor.magFilter = magFilter

@@ -460,9 +460,13 @@ def prepare_fixture(source: Path, destination: Path) -> str:
             raise FixtureError("source world changed while creating the fixture")
         if staged_digest != source_before:
             raise FixtureError("fixture clone does not match the source world")
+        # macOS requires write permission on a directory being renamed.
+        # Publish it before sealing permissions, and transfer cleanup ownership
+        # so a sealing/verification failure also removes the published tree.
+        staging.rename(destination)
+        staging = destination
         _make_tree_read_only(staging)
         verify_read_only(staging)
-        staging.rename(destination)
         return staged_digest
     except Exception:
         _make_tree_writable(staging)
