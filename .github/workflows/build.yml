@@ -40,12 +40,14 @@ jobs:
       - name: make gradle wrapper executable
         run: chmod +x ./gradlew
       - name: build
-        run: ./gradlew buildMacNative build
+        run: ./gradlew buildMacNative assemble
       - name: capture build artifacts
         uses: actions/upload-artifact@v7
         with:
           name: metallum
           path: build/libs/
+      - name: run verification suite
+        run: ./gradlew check
 
   publish:
     needs: build
